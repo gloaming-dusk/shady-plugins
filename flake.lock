@@ -30,11 +30,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1794056175,
-        "narHash": "sha256-7AulCG77oHTsSNtJ8tL9uSNuUNBznx7dxwLEY0m7NOQ=",
+        "lastModified": 1794057837,
+        "narHash": "sha256-NtmMDJM5OKo5DbiVeZcfKO0pNUV43JLfR5ZqS3NjmP8=",
         "owner": "gloaming-dusk",
         "repo": "shady",
-        "rev": "ef1589783f50b034f0fb88606a7fd7b6ff49f81a",
+        "rev": "d6347f690b21c88cc0577713f246fbf1ab458f34",
         "type": "github"
       },
       "original": {
