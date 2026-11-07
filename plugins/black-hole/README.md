@@ -12,5 +12,5 @@ shady.plugins.load("black-hole")
 To test it against a Shady build:
 
 ```bash
-tests/headless-black-hole.sh <shady binary> <directory of the plugin's .so>
+tests/headless-black-hole.sh <Shady build directory> <directory of the plugin's .so>
 ```

@@ -1,0 +1,5 @@
+name = "water-windows"
+description = "Windows turn to water: waves, refraction, caustics"
+keys = ["Super+W"]
+abi = 1
+requires = ["spatial"]

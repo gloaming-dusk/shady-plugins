@@ -1,0 +1,5 @@
+name = "window-constellation"
+description = "The other windows orbit the focused one"
+keys = ["Super+C"]
+abi = 1
+requires = ["spatial"]

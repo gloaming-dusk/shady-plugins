@@ -1,0 +1,5 @@
+name = "frozen-window"
+description = "Frost grows over a window, or the whole workspace, and melts away"
+keys = ["Super+Z", "Super+Shift+Z"]
+abi = 1
+requires = ["spatial"]

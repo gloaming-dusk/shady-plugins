@@ -1,0 +1,5 @@
+name = "magnetic-windows"
+description = "Nearby windows dock together on springs"
+keys = ["Super+M"]
+abi = 1
+requires = ["spatial"]

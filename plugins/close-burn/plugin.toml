@@ -1,0 +1,5 @@
+name = "close-burn"
+description = "Closing windows burn away"
+keys = []
+abi = 1
+requires = ["spatial"]

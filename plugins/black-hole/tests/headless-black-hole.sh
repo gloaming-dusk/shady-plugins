@@ -2,10 +2,10 @@
 # black-hole plugin: shaders build, the hole opens/closes on Super+H, a second
 # press while busy is ignored, and the plugin reloads and unloads cleanly.
 #
-#   tests/headless-black-hole.sh <shady binary> <directory of the plugin's .so>
+#   tests/headless-black-hole.sh <Shady build directory> <directory of the plugin's .so>
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SHADY="$1"
+SHADY="$(cd "$1" && pwd)/shady"
 PLUGIN_DIR="$(cd "$2" && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

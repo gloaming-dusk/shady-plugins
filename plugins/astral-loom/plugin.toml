@@ -1,0 +1,5 @@
+name = "astral-loom"
+description = "The sky and glass panels of the retired Astral Loom rice"
+keys = []
+abi = 1
+requires = ["spatial"]

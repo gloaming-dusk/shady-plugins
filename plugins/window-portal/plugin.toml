@@ -1,0 +1,5 @@
+name = "window-portal"
+description = "A live portal onto another window"
+keys = ["Super+P", "Super+Shift+P"]
+abi = 1
+requires = ["spatial"]

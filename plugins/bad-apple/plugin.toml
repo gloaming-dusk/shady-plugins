@@ -1,0 +1,5 @@
+name = "bad-apple"
+description = "The screen becomes flip-dot tiles that play a video over the desktop, Bad Apple!! being the one it is made for"
+keys = ["Super+A"]
+abi = 1
+requires = ["spatial"]
