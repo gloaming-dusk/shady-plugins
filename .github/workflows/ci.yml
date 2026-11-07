@@ -1,0 +1,16 @@
+name: CI
+on:
+  push:
+  pull_request:
+  # Shady's plugin API may still change: notice when its main breaks a plugin.
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Build and unit-test every plugin against Shady's main
+        run: nix flake check -L --override-input shady github:gloaming-dusk/shady

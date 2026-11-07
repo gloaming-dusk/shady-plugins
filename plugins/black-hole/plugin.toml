@@ -1,0 +1,5 @@
+name = "black-hole"
+description = "The workspace's windows fall into a black hole, and a white hole returns them"
+keys = ["Super+H"]
+abi = 1
+requires = ["spatial"]
