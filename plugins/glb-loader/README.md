@@ -40,10 +40,12 @@ one unit per glTF metre. Scale your model, or its root node, to fit the room.
 - `NORMAL` and `TEXCOORD_0` when present. Primitives without normals are
   flat-shaded. UVs are passed with V flipped, so their origin is bottom-left like
   OBJ's.
+- Colours: each material's `baseColorFactor` times `COLOR_0`, converted to
+  the sRGB Shady draws in. Shady after 0.5.1 draws them; 0.5.1 and older draw
+  the whole environment in one colour.
 
-Shady draws the environment with one lit colour, so materials, textures,
-animations, cameras and lights are ignored. Files that require such extensions
-still load. Files that require Draco or meshopt compression are rejected:
+Textures, other material properties, animations, cameras and lights are
+ignored. Files that require such extensions still load. Files that require Draco or meshopt compression are rejected:
 re-export them without mesh compression. Any other required extension is
 rejected as well.
 
@@ -70,8 +72,9 @@ are not drawn, but still collide.
 A rigged character with walk and idle animations wanders about the floor. It
 picks a spot, turns, walks there with the walk clip, idles a while, and
 picks another, crossfading between the two clips. It is drawn like the
-environment, with one lit colour, and replaces a configured environment while
-it is shown.
+environment, in its material colours, and replaces a configured environment
+while it is shown. A new pose is handed to Shady every frame, about 2 ms of CPU
+for nixchan.
 
 Load it in `config.lua`, and give it a model from `init.lua`. Settings are
 published values, because `config.lua` cannot publish. The plugin watches
@@ -98,11 +101,10 @@ shady.publish("glb-wanderer.speed", "1.5")
 | `walk`, `idle` | `Walk`, `Idle` | animation names; a missing one leaves the rest pose |
 | `height` | `0.6` | her height in world units, in the idle pose |
 | `speed` | `1` | walking speed in the model's own units per second. Match it to the walk clip so the feet stay planted (nixchan's is about 1.5) |
-| `area` | `-2,-3,2,0` | `x0,z0,x1,z1`: the part of the floor she walks in |
-| `fps` | `30` | how often a new pose is handed to Shady |
+| `area` | `-1.1,-2.8,1.1,-1` | `x0,z0,x1,z1`: the part of the floor she walks in |
+| `fps` | `0` | new poses a second; `0` poses her every frame Shady draws |
 
-The model faces +Z, as glTF asks. The scene is rebuilt and uploaded every
-frame, about 2 ms of CPU for nixchan's 54,000 triangles.
+The model faces +Z, as glTF asks.
 
 ## Tests
 

@@ -89,7 +89,7 @@ static void schedule_render(shady_host h) { assert(h == HOST); renders++; }
 static shady_render_callback frame_hook;
 static shady_render_hook_id hook_add(shady_host h, uint32_t stage, shady_render_callback cb, void *u) {
     (void)u;
-    assert(h == HOST && stage == SHADY_RENDER_STAGE_AFTER_BACKGROUND && !frame_hook);
+    assert(h == HOST && stage == SHADY_RENDER_STAGE_OVERLAY && !frame_hook);
     frame_hook = cb;
     return 3;
 }

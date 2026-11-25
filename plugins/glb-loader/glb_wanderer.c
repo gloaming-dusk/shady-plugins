@@ -17,8 +17,8 @@
  *   shady.publish("glb-wanderer.idle", "Idle")
  *   shady.publish("glb-wanderer.height", "0.6")     -- world units, idle pose
  *   shady.publish("glb-wanderer.speed", "1")        -- model units per second
- *   shady.publish("glb-wanderer.area", "-2,-3,2,0") -- x0,z0,x1,z1 on the floor
- *   shady.publish("glb-wanderer.fps", "30")
+ *   shady.publish("glb-wanderer.area", "-1.1,-2.8,1.1,-1") -- x0,z0,x1,z1 on the floor
+ *   shady.publish("glb-wanderer.fps", "0")        -- poses a second; 0: every frame
  *
  * The scene replaces a configured environment while a model is shown.
  */
@@ -204,6 +204,9 @@ static void submit(void) {
 	struct shady_environment_scene scene = {
 		.struct_size = sizeof(scene),
 		.vertices = out.vertices, .vertex_count = out.vertex_count,
+#if GLTF_HOST_HAS_COLORS
+		.colors = out.colors,
+#endif
 		.indices = out.indices, .index_count = out.index_count,
 	};
 	if (!environment->set_scene(host, &scene)) {
@@ -331,13 +334,15 @@ static void configure(void) {
 	/* In the model's units, the speed the walk clip's feet move at, so a
 	 * height change keeps them planted. */
 	double speed = setting_number("speed", 1.0, 0.0, 1000.0);
-	w->frame_interval = 1.0 / setting_number("fps", 30.0, 1.0, 240.0);
-	double area[4] = { -2.0, -3.0, 2.0, 0.0 };
+	/* 0: a new pose every frame the compositor draws. */
+	double fps = setting_number("fps", 0.0, 0.0, 1000.0);
+	w->frame_interval = fps > 0.0 ? 1.0 / fps : 0.0;
+	double area[4] = { -1.1, -2.8, 1.1, -1.0 };
 	const char *a = setting("area");
 	if (a && (sscanf(a, "%lf,%lf,%lf,%lf", &area[0], &area[1], &area[2], &area[3]) != 4 ||
 			!(area[0] < area[2] && area[1] < area[3]))) {
 		log_message(SHADY_PLUGIN_LOG_ERROR, PREFIX ": ignoring area = '%s'", a);
-		area[0] = -2.0, area[1] = -3.0, area[2] = 2.0, area[3] = 0.0;
+		area[0] = -1.1, area[1] = -2.8, area[2] = 1.1, area[3] = -1.0;
 	}
 	memcpy(w->area, area, sizeof(area));
 	if (!(w->x >= area[0] && w->x <= area[2] && w->z >= area[1] && w->z <= area[3])) {
@@ -381,7 +386,9 @@ static bool wants_frames(void) {
 }
 
 /* Draws nothing: it keeps frames coming. The host skips module ticks on the
- * first frame, so asking from tick alone could stall before the first one. */
+ * first frame, so asking from tick alone could stall before the first one.
+ * OVERLAY hooks run every frame; AFTER_BACKGROUND ones only when the cached
+ * sky is redrawn, and asking for frames from one would redraw it each time. */
 static void keep_frames(shady_host h, const struct shady_render_context *ctx, void *data) {
 	(void)h;
 	(void)ctx;
@@ -395,7 +402,7 @@ static bool wanderer_init(struct shady_server *server) {
 	if (!w) return false;
 	w->rng = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull | 1;
 	w->x = w->z = NAN; /* placed by configure */
-	frame_hook = api->render_hook_add(host, SHADY_RENDER_STAGE_AFTER_BACKGROUND, keep_frames, NULL);
+	frame_hook = api->render_hook_add(host, SHADY_RENDER_STAGE_OVERLAY, keep_frames, NULL);
 	api->schedule_render(host);
 	poll_settings();
 	if (!w->model && !setting("model"))
@@ -418,13 +425,15 @@ static void wanderer_tick(struct shady_server *server, float dt, float width, fl
 		w->since_poll = 0.0;
 		poll_settings();
 	}
-	if (!w->model) return;
-	step(step_dt);
-	w->since_frame += step_dt;
-	if (w->since_frame >= w->frame_interval) {
-		w->since_frame = fmod(w->since_frame, w->frame_interval);
-		submit();
+	if (w->model) {
+		step(step_dt);
+		w->since_frame += step_dt;
+		if (w->since_frame >= w->frame_interval) {
+			w->since_frame = w->frame_interval > 0.0 ? fmod(w->since_frame, w->frame_interval) : 0.0;
+			submit();
+		}
 	}
+	if (wants_frames()) api->schedule_render(host);
 }
 
 static void wanderer_destroy(struct shady_server *server) {

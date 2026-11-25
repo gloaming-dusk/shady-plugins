@@ -14,6 +14,17 @@
 
 #include <shady/environment.h>
 
+/* Shady 0.5.1 and older draw the environment in one colour and their scene
+ * has no colors; the reader still makes them, and the plugins drop them. */
+#ifdef SHADY_ENVIRONMENT_SCENE_HAS
+#define GLTF_HOST_HAS_COLORS 1
+#else
+#define GLTF_HOST_HAS_COLORS 0
+struct shady_environment_color {
+	float rgba[4];
+};
+#endif
+
 struct gltf;
 
 /* A node's local transform. Nodes authored with a matrix keep it (and are
@@ -38,6 +49,8 @@ struct gltf_build_options {
 /* Output arrays stay owned by the model and are reused by the next build. */
 struct gltf_scene {
 	const struct shady_environment_vertex *vertices;
+	/* vertex_count display colours: the material's base colour times COLOR_0. */
+	const struct shady_environment_color *colors;
 	size_t vertex_count;
 	const uint32_t *indices;
 	size_t index_count;

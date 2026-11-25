@@ -530,6 +530,7 @@ struct gltf {
 	unsigned char *world_state;
 
 	struct array vertices;  /* struct shady_environment_vertex */
+	struct array colors;    /* struct shady_environment_color, one per vertex */
 	struct array indices;   /* uint32_t */
 	struct array boxes;     /* struct shady_environment_box */
 	struct array triangles; /* struct shady_environment_triangle */
@@ -1400,6 +1401,70 @@ static void skin_matrix(const struct skin *skin, const struct skin_weights *sw, 
 	for (int i = 0; i < 16; ++i) out[i] /= total;
 }
 
+/* Linear (glTF's colour space) to the display's sRGB. */
+static float srgb(double linear) {
+	if (!(linear > 0.0)) return 0.0f;
+	if (linear >= 1.0) return 1.0f;
+	return (float)(linear <= 0.0031308 ? 12.92 * linear : 1.055 * pow(linear, 1.0 / 2.4) - 0.055);
+}
+
+/* The material's baseColorFactor, white without one. */
+static bool material_color(struct gltf *g, const struct json *prim, double rgba[4], const char *what) {
+	rgba[0] = rgba[1] = rgba[2] = rgba[3] = 1.0;
+	const struct json *index = json_get(prim, "material");
+	if (!index) return true;
+	size_t m;
+	const struct json *materials = json_get(&g->root, "materials");
+	if (!json_uint(index, SIZE_MAX, &m) || m >= json_length(materials))
+		return fail(g, "%s: invalid material", what);
+	const struct json *pbr = json_get(json_at(materials, m), "pbrMetallicRoughness");
+	return get_numbers(g, pbr, "baseColorFactor", 4, rgba, what);
+}
+
+/* COLOR_0, VEC3 or VEC4, as RGBA; absent leaves *out NULL. */
+static bool read_vertex_colors(struct gltf *g, const struct json *attributes, size_t count,
+		float **out, const char *what) {
+	*out = NULL;
+	const struct json *v = json_get(attributes, "COLOR_0");
+	size_t index;
+	if (!v) return true;
+	if (!json_uint(v, SIZE_MAX, &index)) return fail(g, "%s: invalid COLOR_0", what);
+	const char *type = json_str(json_get(json_at(g->accessors, index), "type"));
+	unsigned n = type && !strcmp(type, "VEC3") ? 3 : 4;
+	float *c;
+	size_t got;
+	if (!read_accessor(g, index, n, &c, NULL, &got, "COLOR_0")) return false;
+	if (got != count) {
+		free(c);
+		return fail(g, "%s: COLOR_0 has %zu elements, POSITION has %zu", what, got, count);
+	}
+	if (n == 3) {
+		float *rgba = malloc(count * 4 * sizeof(*rgba));
+		if (!rgba) {
+			free(c);
+			return fail(g, "out of memory");
+		}
+		for (size_t i = 0; i < count; ++i) {
+			memcpy(rgba + i * 4, c + i * 3, 3 * sizeof(*c));
+			rgba[i * 4 + 3] = 1.0f;
+		}
+		free(c);
+		c = rgba;
+	}
+	*out = c;
+	return true;
+}
+
+static struct shady_environment_color vertex_color(const double base[4], const float *colors,
+		size_t v) {
+	struct shady_environment_color out;
+	for (int i = 0; i < 4; ++i) {
+		double c = base[i] * (colors ? colors[v * 4 + i] : 1.0);
+		out.rgba[i] = i < 3 ? srgb(c) : (float)fmin(fmax(c, 0.0), 1.0);
+	}
+	return out;
+}
+
 static bool emit_primitive(struct gltf *g, const struct json *prim, const struct json *mesh,
 		const struct json *node, const struct emit *e, const char *what) {
 	size_t mode;
@@ -1423,7 +1488,8 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 		return fail(g, "%s is Draco-compressed, which glb-loader does not decode", what);
 
 	bool ok = false;
-	float *pos = NULL, *nrm = NULL, *uv = NULL, *wpos = NULL, *wnrm = NULL;
+	float *pos = NULL, *nrm = NULL, *uv = NULL, *wpos = NULL, *wnrm = NULL, *vcolor = NULL;
+	double base_color[4];
 	uint32_t *idx = NULL, *tris = NULL, *remap = NULL;
 	struct skin_weights sw = {0};
 	size_t count, index_count = 0, tri_count;
@@ -1431,6 +1497,8 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 	if (!read_accessor(g, position_index, 3, &pos, NULL, &count, "POSITION") ||
 			!read_attribute(g, attributes, "NORMAL", 3, count, &nrm, what) ||
 			!read_attribute(g, attributes, "TEXCOORD_0", 2, count, &uv, what) ||
+			!material_color(g, prim, base_color, what) ||
+			!read_vertex_colors(g, attributes, count, &vcolor, what) ||
 			!apply_morph_targets(g, prim, mesh, node, count, pos, nrm, what))
 		goto done;
 
@@ -1509,12 +1577,14 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 			goto done;
 		}
 		if (!array_reserve(&g->vertices, new_vertices, sizeof(struct shady_environment_vertex)) ||
+				!array_reserve(&g->colors, new_vertices, sizeof(struct shady_environment_color)) ||
 				!array_reserve(&g->indices, tri_count, sizeof(uint32_t))) {
 			fail(g, "out of memory");
 			goto done;
 		}
 		struct shady_environment_vertex *out_v =
 			(struct shady_environment_vertex *)g->vertices.data;
+		struct shady_environment_color *out_c = g->colors.data;
 		uint32_t *out_i = g->indices.data;
 		uint32_t base = (uint32_t)g->vertices.count;
 		if (nrm) {
@@ -1527,9 +1597,11 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 				/* glTF puts the UV origin top-left; the scene, like OBJ, bottom-left. */
 				o->uv[0] = uv ? uv[v * 2] : 0.0f;
 				o->uv[1] = uv ? 1.0f - uv[v * 2 + 1] : 0.0f;
+				out_c[base + remap[v]] = vertex_color(base_color, vcolor, v);
 			}
 			for (size_t t = 0; t < tri_count; ++t) out_i[g->indices.count + t] = base + remap[tris[t]];
 			g->vertices.count += used;
+			g->colors.count += used;
 		} else {
 			/* Flat shading needs a vertex per triangle corner. */
 			for (size_t t = 0; t < tri_count; t += 3) {
@@ -1542,10 +1614,12 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 					memcpy(o->normal, n, sizeof(o->normal));
 					o->uv[0] = uv ? uv[v * 2] : 0.0f;
 					o->uv[1] = uv ? 1.0f - uv[v * 2 + 1] : 0.0f;
+					out_c[base + t + k] = vertex_color(base_color, vcolor, v);
 					out_i[g->indices.count + t + k] = base + (uint32_t)(t + k);
 				}
 			}
 			g->vertices.count += tri_count;
+			g->colors.count += tri_count;
 		}
 		g->indices.count += tri_count;
 	}
@@ -1570,6 +1644,7 @@ done:
 	free(pos);
 	free(nrm);
 	free(uv);
+	free(vcolor);
 	free(wpos);
 	free(wnrm);
 	free(idx);
@@ -2121,10 +2196,11 @@ static void gltf_free_inputs(struct gltf *g) {
 
 static void gltf_free_outputs(struct gltf *g) {
 	free(g->vertices.data);
+	free(g->colors.data);
 	free(g->indices.data);
 	free(g->boxes.data);
 	free(g->triangles.data);
-	g->vertices = g->indices = g->boxes = g->triangles = (struct array){0};
+	g->vertices = g->colors = g->indices = g->boxes = g->triangles = (struct array){0};
 }
 
 static bool glb_parse(struct gltf *g) {
@@ -2176,7 +2252,7 @@ bool gltf_build(struct gltf *g, const struct gltf_build_options *options,
 	static const struct gltf_build_options defaults = { .collision = true };
 	g->options = options ? options : &defaults;
 	g->error[0] = '\0';
-	g->vertices.count = g->indices.count = g->boxes.count = g->triangles.count = 0;
+	g->vertices.count = g->colors.count = g->indices.count = g->boxes.count = g->triangles.count = 0;
 	g->skipped_primitives = g->ignored_instancing = 0;
 	if (g->node_count) memset(g->world_state, NODE_PENDING, g->node_count);
 	bool ok = emit_scene(g);
@@ -2185,6 +2261,7 @@ bool gltf_build(struct gltf *g, const struct gltf_build_options *options,
 	if (!ok) return false;
 	*out = (struct gltf_scene){
 		.vertices = g->vertices.data, .vertex_count = g->vertices.count,
+		.colors = g->colors.data,
 		.indices = g->indices.data, .index_count = g->indices.count,
 		.boxes = g->boxes.data, .box_count = g->boxes.count,
 		.triangles = g->triangles.data, .triangle_count = g->triangles.count,
@@ -2196,6 +2273,7 @@ bool gltf_build(struct gltf *g, const struct gltf_build_options *options,
 
 void gltf_take_scene(struct gltf *g, struct gltf_scene *out) {
 	out->vertices = g->vertices.data;
+	out->colors = g->colors.data;
 	out->vertex_count = g->vertices.count;
 	out->indices = g->indices.data;
 	out->index_count = g->indices.count;
@@ -2203,7 +2281,7 @@ void gltf_take_scene(struct gltf *g, struct gltf_scene *out) {
 	out->box_count = g->boxes.count;
 	out->triangles = g->triangles.data;
 	out->triangle_count = g->triangles.count;
-	g->vertices = g->indices = g->boxes = g->triangles = (struct array){0};
+	g->vertices = g->colors = g->indices = g->boxes = g->triangles = (struct array){0};
 }
 
 size_t gltf_node_count(const struct gltf *g) {

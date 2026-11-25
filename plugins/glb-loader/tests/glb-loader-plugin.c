@@ -214,6 +214,50 @@ static const uint16_t quad_idx[] = { 0, 1, 2, 0, 2, 3 };
 
 /* ---- cases ------------------------------------------------------------- */
 
+/* Material base colours times COLOR_0, converted from linear to sRGB; and
+ * a host whose scene struct predates colors gets none written. */
+static void check_colors(void) {
+#ifdef SHADY_ENVIRONMENT_SCENE_HAS
+    struct doc d;
+    doc_init(&d);
+    const float tri[] = { 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    const float vc[] = { 1, 1, 1, 0.5f, 0.5f, 0.5f, 0, 0, 0 };
+    int pos = floats(&d, tri, 3, "VEC3");
+    int col = floats(&d, vc, 3, "VEC3");
+    char rest[1024];
+    snprintf(rest, sizeof(rest),
+        "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,0.2140411,0,0.5]}}],"
+        "\"meshes\":[{\"primitives\":["
+        "{\"attributes\":{\"POSITION\":%d,\"COLOR_0\":%d},\"material\":0},"
+        "{\"attributes\":{\"POSITION\":%d}}]}],"
+        "\"nodes\":[{\"mesh\":0}]", pos, col, pos);
+    const char *path = write_glb(&d, "colors.glb", rest);
+    assert(load(path));
+    assert(triangles() == 2 && scene.colors);
+    /* Linear 0.2140411 is sRGB 0.5; alpha is kept linear. */
+    const float *c = scene.colors[scene.indices[0]].rgba;
+    assert(near(c[0], 1) && near(c[1], 0.5f) && near(c[2], 0) && near(c[3], 0.5f));
+    c = scene.colors[scene.indices[1]].rgba; /* times COLOR_0 0.5; VEC3 has alpha 1 */
+    assert(near(c[0], 0.7353569f) && near(c[3], 0.5f));
+    c = scene.colors[scene.indices[3]].rgba; /* no material: white */
+    assert(near(c[0], 1) && near(c[1], 1) && near(c[2], 1) && near(c[3], 1));
+    release();
+
+    /* An old host's struct is shorter: nothing may land past it. */
+    struct { struct shady_environment_scene scene; } old;
+    memset(&old, 0xAB, sizeof(old));
+    old.scene.struct_size = SHADY_ENVIRONMENT_SCENE_V1_SIZE;
+    assert(registered->load(HOST, path, &old.scene, registered->user_data));
+    const unsigned char *tail = (const unsigned char *)&old.scene + SHADY_ENVIRONMENT_SCENE_V1_SIZE;
+    for (size_t i = 0; i < sizeof(old.scene) - SHADY_ENVIRONMENT_SCENE_V1_SIZE; ++i)
+        assert(tail[i] == 0xAB);
+    assert(old.scene.vertex_count == 6);
+    registered->release(HOST, &old.scene, registered->user_data);
+    for (size_t i = 0; i < sizeof(old.scene) - SHADY_ENVIRONMENT_SCENE_V1_SIZE; ++i)
+        assert(tail[i] == 0xAB);
+#endif /* older Shady headers have no colours */
+}
+
 static void check_minimal(void) {
     struct doc d;
     doc_init(&d);
@@ -647,6 +691,7 @@ int main(int argc, char **argv) {
     assert(mkdtemp(dir));
 
     check_minimal();
+    check_colors();
     check_transforms();
     check_modes();
     check_accessor_forms();

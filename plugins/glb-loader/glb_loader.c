@@ -56,6 +56,13 @@ static bool glb_load(shady_host h, const char *path,
 	gltf_take_scene(g, &out);
 	gltf_close(g);
 
+	/* The host frees nothing; colours are dropped for a host too old to
+	 * have room for them in the struct it passed. */
+#if GLTF_HOST_HAS_COLORS
+	if (SHADY_ENVIRONMENT_SCENE_HAS(scene, colors)) scene->colors = out.colors;
+	else
+#endif
+		free((void *)out.colors);
 	scene->vertices = out.vertices;
 	scene->vertex_count = out.vertex_count;
 	scene->indices = out.indices;
@@ -71,11 +78,22 @@ static void glb_release(shady_host h, struct shady_environment_scene *scene,
 		void *user_data) {
 	(void)h;
 	(void)user_data;
+#if GLTF_HOST_HAS_COLORS
+	if (SHADY_ENVIRONMENT_SCENE_HAS(scene, colors)) {
+		free((void *)scene->colors);
+		scene->colors = NULL;
+	}
+#endif
 	free((void *)scene->vertices);
 	free((void *)scene->indices);
 	free((void *)scene->boxes);
 	free((void *)scene->triangles);
-	*scene = (struct shady_environment_scene){ .struct_size = sizeof(*scene) };
+	/* Only the members every host's struct has: it may be smaller than ours. */
+	scene->vertices = NULL;
+	scene->indices = NULL;
+	scene->boxes = NULL;
+	scene->triangles = NULL;
+	scene->vertex_count = scene->index_count = scene->box_count = scene->triangle_count = 0;
 }
 
 static const char *const glb_extensions[] = { "glb", NULL };
