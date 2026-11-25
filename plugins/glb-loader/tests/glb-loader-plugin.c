@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <zlib.h>
 
 static int host_object;
 #define HOST ((shady_host)&host_object)
@@ -234,11 +235,12 @@ static void check_colors(void) {
     const char *path = write_glb(&d, "colors.glb", rest);
     assert(load(path));
     assert(triangles() == 2 && scene.colors);
-    /* Linear 0.2140411 is sRGB 0.5; alpha is kept linear. */
+    /* Linear 0.2140411 is sRGB 0.5. Alpha is how shaded a vertex is: fully,
+     * whatever the material's alpha. */
     const float *c = scene.colors[scene.indices[0]].rgba;
-    assert(near(c[0], 1) && near(c[1], 0.5f) && near(c[2], 0) && near(c[3], 0.5f));
-    c = scene.colors[scene.indices[1]].rgba; /* times COLOR_0 0.5; VEC3 has alpha 1 */
-    assert(near(c[0], 0.7353569f) && near(c[3], 0.5f));
+    assert(near(c[0], 1) && near(c[1], 0.5f) && near(c[2], 0) && near(c[3], 1));
+    c = scene.colors[scene.indices[1]].rgba; /* times COLOR_0 0.5 */
+    assert(near(c[0], 0.7353569f) && near(c[3], 1));
     c = scene.colors[scene.indices[3]].rgba; /* no material: white */
     assert(near(c[0], 1) && near(c[1], 1) && near(c[2], 1) && near(c[3], 1));
     release();
@@ -256,6 +258,83 @@ static void check_colors(void) {
     for (size_t i = 0; i < sizeof(old.scene) - SHADY_ENVIRONMENT_SCENE_V1_SIZE; ++i)
         assert(tail[i] == 0xAB);
 #endif /* older Shady headers have no colours */
+}
+
+#ifdef SHADY_ENVIRONMENT_SCENE_TOON
+/* A PNG of w x h RGBA8 pixels (rows top first), built with zlib. */
+static size_t make_png(const uint8_t *rgba, uint32_t w, uint32_t h, uint8_t *out) {
+    uint8_t raw[1024], z[1024];
+    size_t r = 0;
+    for (uint32_t y = 0; y < h; ++y) {
+        raw[r++] = 0; /* filter: none */
+        memcpy(raw + r, rgba + (size_t)y * w * 4, (size_t)w * 4);
+        r += (size_t)w * 4;
+    }
+    uLongf zl = sizeof(z);
+    assert(compress(z, &zl, raw, (uLong)r) == Z_OK);
+    size_t n = 0;
+    memcpy(out, "\x89PNG\r\n\x1a\n", 8);
+    n = 8;
+#define BE32(v) (out[n++] = (uint8_t)((v) >> 24), out[n++] = (uint8_t)((v) >> 16), \
+        out[n++] = (uint8_t)((v) >> 8), out[n++] = (uint8_t)(v))
+#define CHUNK(type, data, len) do { \
+        BE32((uint32_t)(len)); size_t at = n; memcpy(out + n, type, 4); n += 4; \
+        memcpy(out + n, data, len); n += (len); \
+        BE32((uint32_t)crc32(0, out + at, (uInt)((len) + 4))); } while (0)
+    uint8_t ihdr[13] = { 0, 0, 0, (uint8_t)w, 0, 0, 0, (uint8_t)h, 8, 6, 0, 0, 0 };
+    CHUNK("IHDR", ihdr, 13);
+    CHUNK("IDAT", z, zl);
+    CHUNK("IEND", "", 0);
+#undef CHUNK
+#undef BE32
+    return n;
+}
+#endif
+
+/* A base colour texture reaches the scene through the atlas: each corner of
+ * a textured quad samples its own texel, an untextured triangle white. */
+static void check_textures(void) {
+#ifdef SHADY_ENVIRONMENT_SCENE_TOON
+    struct doc d;
+    doc_init(&d);
+    static const uint8_t texels[16] = {
+        255, 0, 0, 255,   0, 255, 0, 255,   /* top: red, green */
+        0, 0, 255, 255,   255, 255, 0, 255, /* bottom: blue, yellow */
+    };
+    uint8_t png[2048];
+    size_t png_size = make_png(texels, 2, 2, png);
+    int image_view = add_view(&d, png, png_size, 0);
+    int pos = floats(&d, quad_pos, 4, "VEC3");
+    /* quad_pos: (0,0) (1,0) (1,1) (0,1) in x,y; uv top-left origin. */
+    static const float uv[] = { 0, 1, 1, 1, 1, 0, 0, 0 };
+    int tex = floats(&d, uv, 4, "VEC2");
+    int idx = indices16(&d, quad_idx, 6);
+    char rest[1024];
+    snprintf(rest, sizeof(rest),
+        "\"images\":[{\"bufferView\":%d,\"mimeType\":\"image/png\"}],"
+        "\"textures\":[{\"source\":0}],"
+        "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0}}}],"
+        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":%d,\"TEXCOORD_0\":%d},"
+        "\"indices\":%d,\"material\":0},{\"attributes\":{\"POSITION\":%d},\"indices\":%d}]}],"
+        "\"nodes\":[{\"mesh\":0}]", image_view, pos, tex, idx, pos, idx);
+    assert(load(write_glb(&d, "texture.glb", rest)));
+    assert(scene.texture && scene.texture_width >= 2 && scene.texture_height >= 2);
+    const uint8_t expect[4][3] = { { 0, 0, 255 }, { 255, 255, 0 }, { 0, 255, 0 }, { 255, 0, 0 } };
+    for (size_t i = 0; i < scene.index_count; ++i) {
+        const struct shady_environment_vertex *v = &scene.vertices[scene.indices[i]];
+        size_t x = (size_t)(v->uv[0] * scene.texture_width);
+        size_t y = (size_t)((1.0f - v->uv[1]) * scene.texture_height);
+        const uint8_t *t = scene.texture + (y * scene.texture_width + x) * 4;
+        if (i < 6) {
+            /* Which corner: quad_pos (x, y) -> uv row/column. */
+            int corner = v->position[0] > 0.5f ? (v->position[1] > 0.5f ? 2 : 1) : (v->position[1] > 0.5f ? 3 : 0);
+            assert(t[0] == expect[corner][0] && t[1] == expect[corner][1] && t[2] == expect[corner][2]);
+        } else {
+            assert(t[0] == 255 && t[1] == 255 && t[2] == 255 && t[3] == 255);
+        }
+    }
+    release();
+#endif
 }
 
 static void check_minimal(void) {
@@ -692,6 +771,7 @@ int main(int argc, char **argv) {
 
     check_minimal();
     check_colors();
+    check_textures();
     check_transforms();
     check_modes();
     check_accessor_forms();

@@ -19,6 +19,11 @@
  *   shady.publish("glb-wanderer.speed", "1")        -- model units per second
  *   shady.publish("glb-wanderer.area", "-1.1,-2.8,1.1,-1") -- x0,z0,x1,z1 on the floor
  *   shady.publish("glb-wanderer.fps", "0")        -- poses a second; 0: every frame
+ *   shady.publish("glb-wanderer.toon", "1")       -- cel shading and a rim light
+ *   shady.publish("glb-wanderer.ink", "#1d1b3a:0.012")  -- outline colour:width
+ *   shady.publish("glb-wanderer.ink_materials", "Hair=#8a85c4:0.009")
+ *   shady.publish("glb-wanderer.uninked", "Cords,*Laces,Rod*")  -- node names
+ *   shady.publish("glb-wanderer.shade", "Face=0.28")  -- material=shading 0..1
  *
  * The scene replaces a configured environment while a model is shown.
  */
@@ -52,6 +57,7 @@
 
 static const char *const setting_keys[] = {
 	"model", "hide", "walk", "idle", "height", "speed", "area", "fps",
+	"toon", "ink", "ink_materials", "uninked", "shade",
 };
 #define SETTING_COUNT (sizeof(setting_keys) / sizeof(*setting_keys))
 
@@ -86,6 +92,17 @@ struct wanderer {
 	double walk_time, idle_time, walk_weight;
 	double since_frame;
 	uint64_t rng;
+
+	/* Looks, from the settings. */
+	bool toon;
+	bool has_ink;
+	struct gltf_ink ink;
+	struct ink_rule { char *material; struct gltf_ink ink; } *ink_rules;
+	size_t ink_rule_count;
+	char **uninked;
+	size_t uninked_count;
+	struct shade_rule { char *material; float shade; } *shade_rules;
+	size_t shade_rule_count;
 };
 
 static struct wanderer *w;
@@ -168,9 +185,40 @@ static bool pose_now(void) {
 	return true;
 }
 
+/* "*x" ends with x, "x*" starts with it, "*x*" contains it, else equals it. */
+static bool name_matches(const char *name, const char *pattern) {
+	size_t n = strlen(name), p = strlen(pattern);
+	bool head = p && pattern[0] == '*', tail = p > (size_t)head && pattern[p - 1] == '*';
+	const char *core = pattern + head;
+	size_t c = p - head - tail;
+	if (head && tail) {
+		for (size_t i = 0; i + c <= n; ++i)
+			if (!strncmp(name + i, core, c)) return true;
+		return false;
+	}
+	if (head) return n >= c && !strncmp(name + n - c, core, c);
+	if (tail) return n >= c && !strncmp(name, core, c);
+	return !strcmp(name, pattern);
+}
+
+static void look_for(const char *node, const char *material, struct gltf_look *look, void *data) {
+	(void)data;
+	for (size_t i = 0; i < w->shade_rule_count; ++i)
+		if (!strcmp(material, w->shade_rules[i].material)) look->shade = w->shade_rules[i].shade;
+	if (!w->has_ink) return;
+	for (size_t i = 0; i < w->uninked_count; ++i)
+		if (name_matches(node, w->uninked[i])) return;
+	look->ink = w->ink;
+	for (size_t i = 0; i < w->ink_rule_count; ++i)
+		if (!strcmp(material, w->ink_rules[i].material)) look->ink = w->ink_rules[i].ink;
+}
+
 static bool build(const double *root, struct gltf_scene *out) {
 	struct gltf_build_options options = {
 		.pose = w->pose, .hidden = w->hidden, .root = root, .collision = false,
+		/* The ink shell is drawn by culling its front faces. */
+		.cull_back_faces = w->has_ink,
+		.look = look_for,
 	};
 	return pose_now() && gltf_build(w->model, &options, out);
 }
@@ -206,6 +254,12 @@ static void submit(void) {
 		.vertices = out.vertices, .vertex_count = out.vertex_count,
 #if GLTF_HOST_HAS_COLORS
 		.colors = out.colors,
+#endif
+#if GLTF_HOST_HAS_LOOKS
+		.flags = (w->toon ? SHADY_ENVIRONMENT_SCENE_TOON : 0u) |
+			(w->has_ink ? SHADY_ENVIRONMENT_SCENE_CULL_BACK_FACES : 0u),
+		.texture = out.texture, .texture_width = out.texture_width,
+		.texture_height = out.texture_height, .texture_key = out.texture_key,
 #endif
 		.indices = out.indices, .index_count = out.index_count,
 	};
@@ -253,6 +307,94 @@ static void step(double dt) {
 	w->z += cos(w->yaw) * forward;
 	w->walk_weight = fmin(1.0, w->walk_weight + BLEND_RATE * dt);
 	w->walk_time += dt;
+}
+
+static void free_looks(void) {
+	for (size_t i = 0; i < w->ink_rule_count; ++i) free(w->ink_rules[i].material);
+	for (size_t i = 0; i < w->uninked_count; ++i) free(w->uninked[i]);
+	for (size_t i = 0; i < w->shade_rule_count; ++i) free(w->shade_rules[i].material);
+	free(w->ink_rules);
+	free(w->uninked);
+	free(w->shade_rules);
+	w->ink_rules = NULL;
+	w->uninked = NULL;
+	w->shade_rules = NULL;
+	w->ink_rule_count = w->uninked_count = w->shade_rule_count = 0;
+	w->has_ink = w->toon = false;
+}
+
+/* "#rrggbb:width" */
+static bool parse_ink(const char *text, struct gltf_ink *ink) {
+	unsigned r, g, b;
+	double width;
+	char end;
+	if (sscanf(text, " #%2x%2x%2x:%lf %c", &r, &g, &b, &width, &end) != 4 ||
+			!(width > 0.0 && width < 10.0))
+		return false;
+	*ink = (struct gltf_ink){ { r / 255.0f, g / 255.0f, b / 255.0f, 1.0f }, width };
+	return true;
+}
+
+/* Split "a,b,c" on commas (and spaces) into strdup'd words. */
+static size_t split_list(const char *list, char ***out) {
+	*out = NULL;
+	if (!list) return 0;
+	char *copy = strdup(list), *save = NULL;
+	size_t n = 0;
+	if (!copy) return 0;
+	for (char *word = strtok_r(copy, ", ", &save); word; word = strtok_r(NULL, ", ", &save)) {
+		char **grown = realloc(*out, (n + 1) * sizeof(**out));
+		if (!grown) break;
+		*out = grown;
+		if (!((*out)[n] = strdup(word))) break;
+		n++;
+	}
+	free(copy);
+	return n;
+}
+
+static void read_looks(void) {
+	free_looks();
+	const char *toon = setting("toon");
+	w->toon = toon && strcmp(toon, "0") && strcmp(toon, "false") && strcmp(toon, "no");
+	const char *ink = setting("ink");
+	if (ink) {
+		w->has_ink = parse_ink(ink, &w->ink);
+		if (!w->has_ink) log_message(SHADY_PLUGIN_LOG_ERROR, PREFIX ": ignoring ink = '%s'", ink);
+	}
+	char **rules;
+	size_t n = split_list(setting("ink_materials"), &rules);
+	w->ink_rules = n ? calloc(n, sizeof(*w->ink_rules)) : NULL;
+	for (size_t i = 0; i < n; ++i) {
+		char *eq = strchr(rules[i], '=');
+		struct gltf_ink ink_rule;
+		if (w->ink_rules && eq && (*eq = '\0', parse_ink(eq + 1, &ink_rule))) {
+			w->ink_rules[w->ink_rule_count].material = rules[i];
+			w->ink_rules[w->ink_rule_count++].ink = ink_rule;
+			continue;
+		}
+		if (eq) *eq = '=';
+		log_message(SHADY_PLUGIN_LOG_ERROR, PREFIX ": ignoring ink_materials entry '%s'", rules[i]);
+		free(rules[i]);
+	}
+	free(rules);
+	w->uninked_count = split_list(setting("uninked"), &w->uninked);
+
+	n = split_list(setting("shade"), &rules);
+	w->shade_rules = n ? calloc(n, sizeof(*w->shade_rules)) : NULL;
+	for (size_t i = 0; i < n; ++i) {
+		char *eq = strchr(rules[i], '='), *end = NULL;
+		double shade = eq ? strtod(eq + 1, &end) : -1.0;
+		if (w->shade_rules && eq && end != eq + 1 && !*end && shade >= 0.0 && shade <= 1.0) {
+			*eq = '\0';
+			w->shade_rules[w->shade_rule_count].material = rules[i];
+			w->shade_rules[w->shade_rule_count++].shade = (float)shade;
+			continue;
+		}
+		log_message(SHADY_PLUGIN_LOG_ERROR, PREFIX ": ignoring shade entry '%s'", rules[i]);
+		free(rules[i]);
+	}
+	free(rules);
 }
 
 static void hide_nodes(void) {
@@ -328,6 +470,7 @@ static void configure(void) {
 		return;
 	}
 	hide_nodes();
+	read_looks();
 	w->walk_clip = find_clip("walk", "Walk", &w->walk_duration);
 	w->idle_clip = find_clip("idle", "Idle", &w->idle_duration);
 
@@ -443,6 +586,7 @@ static void wanderer_destroy(struct shady_server *server) {
 	if (!w) return;
 	hide_scene();
 	close_model();
+	free_looks();
 	for (size_t i = 0; i < SETTING_COUNT; ++i) free(w->settings[i]);
 	free(w);
 	w = NULL;

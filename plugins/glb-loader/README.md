@@ -37,14 +37,17 @@ one unit per glTF metre. Scale your model, or its root node, to fit the room.
 - Morph targets at their default `weights`, and skins in their rest pose.
 - `EXT_mesh_gpu_instancing` and `KHR_node_visibility`.
 - Buffers in the `.glb`'s BIN chunk, in `data:` URIs, or in files next to it.
-- `NORMAL` and `TEXCOORD_0` when present. Primitives without normals are
-  flat-shaded. UVs are passed with V flipped, so their origin is bottom-left like
-  OBJ's.
+- `NORMAL` when present; primitives without normals are flat-shaded.
 - Colours: each material's `baseColorFactor` times `COLOR_0`, converted to
-  the sRGB Shady draws in. Shady after 0.5.1 draws them; 0.5.1 and older draw
-  the whole environment in one colour.
+  the sRGB Shady draws in.
+- Base colour textures (PNG, in the `.glb`, a `data:` URI or a file), with
+  their `texCoord` set and `MASK`/`BLEND` alpha cut out. They are packed into
+  one atlas (halved until it fits 4096 a side), so a texture is clamped, not
+  repeated. JPEG textures are left out, and their primitives drawn untextured.
+- Double-sided materials, drawn from both sides.
 
-Textures, other material properties, animations, cameras and lights are
+Shady 0.5.1 and older draw the whole environment in one colour, without
+textures. Other material properties, animations, cameras and lights are
 ignored. Files that require such extensions still load. Files that require Draco or meshopt compression are rejected:
 re-export them without mesh compression. Any other required extension is
 rejected as well.
@@ -72,7 +75,7 @@ are not drawn, but still collide.
 A rigged character with walk and idle animations wanders about the floor. It
 picks a spot, turns, walks there with the walk clip, idles a while, and
 picks another, crossfading between the two clips. It is drawn like the
-environment, in its material colours, and replaces a configured environment
+environment, in its colours and textures, and replaces a configured environment
 while it is shown. A new pose is handed to Shady every frame, about 2 ms of CPU
 for nixchan.
 
@@ -103,6 +106,11 @@ shady.publish("glb-wanderer.speed", "1.5")
 | `speed` | `1` | walking speed in the model's own units per second. Match it to the walk clip so the feet stay planted (nixchan's is about 1.5) |
 | `area` | `-1.1,-2.8,1.1,-1` | `x0,z0,x1,z1`: the part of the floor she walks in |
 | `fps` | `0` | new poses a second; `0` poses her every frame Shady draws |
+| `toon` | | `1`: toon shading in three bands, with a rim light |
+| `ink` | | `#rrggbb:width`: an ink line round every mesh, `width` model units out |
+| `ink_materials` | | `Material=#rrggbb:width,...`: another line for those materials |
+| `uninked` | | node names without a line, comma-separated; `*` at either end matches the rest |
+| `shade` | | `Material=0.28,...`: how strongly light and shade fall on a material (1 fully, 0 unlit) |
 
 The model faces +Z, as glTF asks.
 
@@ -110,8 +118,9 @@ The model faces +Z, as glTF asks.
 
 `meson test` loads `.glb` files built byte by byte through a fake host. They
 cover the scene graph, every accessor form, primitive modes, morph targets,
-skins, instancing, collision, the three buffer sources, and malformed and
-randomly corrupted input. A second test drives `glb-wanderer` with a small
-animated model: waiting for its model, walking within its area, reloading on
-a settings change, and clearing its scene. `tests/headless-glb-loader.sh` and
+skins, instancing, collision, the three buffer sources, colours, a PNG
+texture through the atlas, and malformed and randomly corrupted input. A second
+test drives `glb-wanderer` with a small animated model: waiting for its model,
+walking within its area, toon, ink and shade, reloading on a settings change,
+and clearing its scene. `tests/headless-glb-loader.sh` and
 `tests/headless-glb-wanderer.sh` run each plugin in a real compositor.

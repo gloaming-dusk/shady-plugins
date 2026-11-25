@@ -21,11 +21,17 @@
 static int host_object;
 #define HOST ((shady_host)&host_object)
 
-static struct { const char *key; char value[512]; bool set; } values[8];
+static struct { const char *key; char value[512]; bool set; } values[16];
 static int scenes_set, scenes_cleared, renders;
 static bool scene_owned;
 static float last_min_y, last_max_y, last_center[3];
 static size_t last_triangles;
+#ifdef SHADY_ENVIRONMENT_SCENE_TOON
+/* Of the last scene: its flags, and its vertices unlit (alpha 0, all of them
+ * ink red) and half shaded. */
+static uint32_t last_flags;
+static size_t last_unlit, last_half;
+#endif
 
 static const char *published_value(shady_host h, const char *key) {
     assert(h == HOST);
@@ -61,6 +67,19 @@ static bool set_scene(shady_host h, const struct shady_environment_scene *s) {
     }
     for (int k = 0; k < 3; ++k) last_center[k] = (float)(c[k] / s->vertex_count);
     last_triangles = s->index_count / 3;
+#ifdef SHADY_ENVIRONMENT_SCENE_TOON
+    last_flags = s->flags;
+    last_unlit = last_half = 0;
+    for (size_t i = 0; s->colors && i < s->vertex_count; ++i) {
+        const float *c = s->colors[i].rgba;
+        if (c[3] == 0.0f) {
+            assert(c[0] == 1.0f && c[1] == 0.0f && c[2] == 0.0f);
+            last_unlit++;
+        } else if (c[3] == 0.5f) {
+            last_half++;
+        }
+    }
+#endif
     scenes_set++;
     scene_owned = true;
     return true;
@@ -171,6 +190,36 @@ static void write_character(const char *path) {
     fclose(f);
 }
 
+#ifdef SHADY_ENVIRONMENT_SCENE_TOON
+/* One triangle facing +Z, with normals, in a material named Skin. */
+static void write_triangle(const char *path) {
+    static const float data[] = { 0, 0, 0, 1, 0, 0, 0, 1, 0,   0, 0, 1, 0, 0, 1, 0, 0, 1 };
+    char json[1024];
+    snprintf(json, sizeof(json),
+        "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"byteLength\":72}],"
+        "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36},{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36}],"
+        "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}],"
+        "\"materials\":[{\"name\":\"Skin\"}],"
+        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1},\"material\":0}]}],"
+        "\"nodes\":[{\"name\":\"Tri\",\"mesh\":0}]}");
+    size_t jl = strlen(json), jp = (jl + 3) & ~(size_t)3;
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    put32(f, 0x46546C67u);
+    put32(f, 2);
+    put32(f, (uint32_t)(12 + 8 + jp + 8 + sizeof(data)));
+    put32(f, (uint32_t)jp);
+    put32(f, 0x4E4F534Au);
+    fwrite(json, 1, jl, f);
+    for (size_t i = jl; i < jp; ++i) fputc(' ', f);
+    put32(f, (uint32_t)sizeof(data));
+    put32(f, 0x004E4942u);
+    fwrite(data, 1, sizeof(data), f);
+    fclose(f);
+}
+#endif
+
 static const struct shady_module *module;
 
 /* A frame: the render hook, then the module tick, as the host runs them. */
@@ -237,6 +286,30 @@ int main(int argc, char **argv) {
     run(0.6);
     assert(last_triangles == 24);
     assert(fabsf(last_max_y - last_min_y - 1.0f) < 0.05f);
+
+#ifdef SHADY_ENVIRONMENT_SCENE_TOON
+    /* Looks: toon, an ink shell (unlit, red, wound the other way) for every
+     * node but the uninked, a half shade for the Skin material. */
+    char tri[300];
+    snprintf(tri, sizeof(tri), "%s/triangle.glb", dir);
+    write_triangle(tri);
+    publish("glb-wanderer.toon", "1");
+    publish("glb-wanderer.ink", "#ff0000:0.05");
+    publish("glb-wanderer.shade", "Skin=0.5");
+    publish("glb-wanderer.model", tri);
+    run(0.6);
+    assert(last_flags == (SHADY_ENVIRONMENT_SCENE_TOON | SHADY_ENVIRONMENT_SCENE_CULL_BACK_FACES));
+    assert(last_triangles == 2 && last_unlit == 3 && last_half == 3);
+    publish("glb-wanderer.uninked", "T*");
+    run(0.6);
+    assert(last_triangles == 1 && last_unlit == 0 && last_half == 3);
+    publish("glb-wanderer.ink", NULL);
+    publish("glb-wanderer.toon", NULL);
+    publish("glb-wanderer.uninked", NULL);
+    run(0.6);
+    assert(last_flags == 0 && last_triangles == 1);
+    unlink(tri);
+#endif
 
     /* A broken model clears the scene; a good one brings it back. */
     publish("glb-wanderer.model", "/nonexistent/character.glb");

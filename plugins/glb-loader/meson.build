@@ -6,29 +6,31 @@ if not cc.has_header('shady/environment.h')
   error('Shady\'s headers (shady/environment.h) were not found; install Shady, or use the flake')
 endif
 m = cc.find_library('m')
+# PNG textures are inflated with zlib.
+zlib = dependency('zlib')
 plugin_dir = join_paths(get_option('libdir'), 'shady', 'plugins')
 
-# Both plugins read glTF with gltf.c.
-gltf = static_library('gltf', 'gltf.c', dependencies: [m], pic: true)
+# Both plugins read glTF with gltf.c (and its textures with image.c).
+gltf = static_library('gltf', 'gltf.c', 'image.c', dependencies: [m, zlib], pic: true)
 
 # Named <extension>-loader, so Shady loads it for a configured .glb environment.
 plugin = shared_module('shady-plugin-glb-loader',
   'glb_loader.c',
   link_with: gltf,
-  dependencies: [m],
+  dependencies: [m, zlib],
   install: true,
   install_dir: plugin_dir)
 
 wanderer = shared_module('shady-plugin-glb-wanderer',
   'glb_wanderer.c',
   link_with: gltf,
-  dependencies: [m],
+  dependencies: [m, zlib],
   install: true,
   install_dir: plugin_dir)
 
 test('glb-loader-plugin',
   executable('glb-loader-plugin-test', 'tests/glb-loader-plugin.c',
-    dependencies: [cc.find_library('dl', required: false), m],
+    dependencies: [cc.find_library('dl', required: false), m, zlib],
     install: false),
   args: [plugin.full_path()],
   depends: plugin)

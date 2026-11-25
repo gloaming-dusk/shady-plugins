@@ -24,6 +24,12 @@ struct shady_environment_color {
 	float rgba[4];
 };
 #endif
+/* Toon shading, culling and a texture came after colours. */
+#ifdef SHADY_ENVIRONMENT_SCENE_TOON
+#define GLTF_HOST_HAS_LOOKS 1
+#else
+#define GLTF_HOST_HAS_LOOKS 0
+#endif
 
 struct gltf;
 
@@ -35,6 +41,26 @@ struct gltf_trs {
 	double m[16];
 };
 
+/* An ink line: a back-facing shell pushed out `width` model units along the
+ * normals (0: none), drawn unlit in `rgba` (display sRGB). Needs
+ * cull_back_faces. */
+struct gltf_ink {
+	float rgba[4];
+	double width;
+};
+
+/* How a primitive is drawn beyond its material. */
+struct gltf_look {
+	/* How strongly light and shade fall on it (the colours' alpha): 1 fully. */
+	float shade;
+	struct gltf_ink ink;
+};
+
+/* Adjust *look (it comes as shade 1, no ink) for a primitive of the node named
+ * `node` in the material named `material` (either may be ""). */
+typedef void (*gltf_look_fn)(const char *node, const char *material, struct gltf_look *look,
+	void *data);
+
 struct gltf_build_options {
 	/* Local transform per node (gltf_node_count entries); NULL: as authored. */
 	const struct gltf_trs *pose;
@@ -44,12 +70,19 @@ struct gltf_build_options {
 	const double *root;
 	/* Export collision_* nodes as collision. */
 	bool collision;
+	/* The host culls back faces: give double-sided materials their back
+	 * faces as triangles of their own. */
+	bool cull_back_faces;
+	/* Per-primitive looks; NULL: shade 1, no ink. */
+	gltf_look_fn look;
+	void *look_data;
 };
 
 /* Output arrays stay owned by the model and are reused by the next build. */
 struct gltf_scene {
 	const struct shady_environment_vertex *vertices;
-	/* vertex_count display colours: the material's base colour times COLOR_0. */
+	/* vertex_count display colours: the material's base colour times COLOR_0;
+	 * alpha is the look's shade (1 without a look function). */
 	const struct shady_environment_color *colors;
 	size_t vertex_count;
 	const uint32_t *indices;
@@ -58,9 +91,16 @@ struct gltf_scene {
 	size_t box_count;
 	const struct shady_environment_triangle *triangles;
 	size_t triangle_count;
+	/* The materials' base colour textures in one atlas (RGBA8, rows top
+	 * first), which the vertices' uvs point into; NULL without textures.
+	 * Owned by the model and the same for every build, with one key. */
+	const uint8_t *texture;
+	uint32_t texture_width, texture_height;
+	uint64_t texture_key;
 	/* Notes for the log; zero normally. */
 	size_t skipped_primitives;
 	size_t ignored_instancing;
+	size_t skipped_images; /* JPEG or broken: drawn untextured */
 };
 
 /* NULL on failure, with the reason in error. */
@@ -71,7 +111,8 @@ const char *gltf_error(const struct gltf *g);
 
 bool gltf_build(struct gltf *g, const struct gltf_build_options *options,
 	struct gltf_scene *out);
-/* Hand the arrays of the last build to the caller, to free() each. */
+/* Hand the arrays of the last build, and the texture atlas, to the caller,
+ * to free() each; later builds have no texture. */
 void gltf_take_scene(struct gltf *g, struct gltf_scene *out);
 
 size_t gltf_node_count(const struct gltf *g);

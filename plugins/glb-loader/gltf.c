@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 
 #include "gltf.h"
+#include "image.h"
 
 #define COLLISION_PREFIX "collision_"
 
@@ -538,6 +539,17 @@ struct gltf {
 	size_t skipped_primitives;
 	size_t ignored_instancing;
 
+	/* Base colour textures packed in one atlas, built on the first build
+	 * that needs it. Image i's texels are atlas_rect[i] (x, y, w, h), w 0
+	 * when it is not in the atlas. */
+	bool atlas_done;
+	uint8_t *atlas;
+	uint32_t atlas_w, atlas_h;
+	uint32_t (*atlas_rect)[4];
+	size_t image_count;
+	uint64_t atlas_key;
+	size_t skipped_images;
+
 	/* The build in progress. */
 	const struct gltf_build_options *options;
 
@@ -793,6 +805,8 @@ static bool load_buffer_uri(struct gltf *g, size_t index, const char *uri, struc
 		return fail(g, "buffer %zu: holds %zu bytes, byteLength is %zu",
 			index, size, b->length);
 	}
+	/* Asked with no length (an image): it is as long as what was read. */
+	if (!b->length) b->length = size;
 	b->data = b->owned;
 	return true;
 }
@@ -1455,14 +1469,267 @@ static bool read_vertex_colors(struct gltf *g, const struct json *attributes, si
 	return true;
 }
 
+/* Alpha is not the material's (Shady draws opaque) but how shaded it is. */
 static struct shady_environment_color vertex_color(const double base[4], const float *colors,
-		size_t v) {
+		size_t v, float shade) {
 	struct shady_environment_color out;
-	for (int i = 0; i < 4; ++i) {
-		double c = base[i] * (colors ? colors[v * 4 + i] : 1.0);
-		out.rgba[i] = i < 3 ? srgb(c) : (float)fmin(fmax(c, 0.0), 1.0);
-	}
+	for (int i = 0; i < 3; ++i) out.rgba[i] = srgb(base[i] * (colors ? colors[v * 4 + i] : 1.0));
+	out.rgba[3] = shade;
 	return out;
+}
+
+
+/* ------------------------------------------------------------------------ */
+/* Textures                                                                 */
+
+#define ATLAS_MAX 4096u
+#define ATLAS_PAD 2u
+/* A white block every untextured vertex samples, so one draw serves all. */
+#define WHITE_SIZE 4u
+
+/* The image a material's baseColorTexture shows and its texCoord set, or -1. */
+static ptrdiff_t material_image(struct gltf *g, const struct json *material, size_t *tex_coord) {
+	const struct json *info = json_get(json_get(material, "pbrMetallicRoughness"), "baseColorTexture");
+	size_t texture, image;
+	*tex_coord = 0;
+	if (!info || !json_uint(json_get(info, "index"), SIZE_MAX, &texture)) return -1;
+	const struct json *t = json_at(json_get(&g->root, "textures"), texture);
+	if (!json_uint(json_get(t, "source"), SIZE_MAX, &image) || image >= g->image_count) return -1;
+	if (json_get(info, "texCoord") && !json_uint(json_get(info, "texCoord"), 7, tex_coord))
+		*tex_coord = 0;
+	return (ptrdiff_t)image;
+}
+
+static bool material_masked(const struct json *material) {
+	const char *mode = json_str(json_get(material, "alphaMode"));
+	return mode && strcmp(mode, "OPAQUE");
+}
+
+/* The encoded bytes of image i: from a bufferView, a data: URI or a file. */
+static bool image_bytes(struct gltf *g, size_t i, const uint8_t **data, size_t *size,
+		uint8_t **owned) {
+	const struct json *img = json_at(json_get(&g->root, "images"), i);
+	*owned = NULL;
+	size_t view;
+	if (json_get(img, "bufferView")) {
+		if (!json_uint(json_get(img, "bufferView"), SIZE_MAX, &view) || view >= g->view_count)
+			return false;
+		char what[48];
+		snprintf(what, sizeof(what), "image %zu", i);
+		*data = view_data(g, view, what);
+		*size = g->views[view].length;
+		g->error[0] = '\0'; /* a missing image only leaves it untextured */
+		return *data != NULL;
+	}
+	const char *uri = json_str(json_get(img, "uri"));
+	if (!uri) return false;
+	/* load_buffer_uri reads data: URIs and relative files; reuse it. */
+	struct buffer b = { .length = 0 };
+	char saved[sizeof(g->error)];
+	memcpy(saved, g->error, sizeof(saved));
+	bool ok = load_buffer_uri(g, i, uri, &b);
+	memcpy(g->error, saved, sizeof(saved));
+	if (!ok) {
+		free(b.owned);
+		return false;
+	}
+	*owned = b.owned;
+	*data = b.owned;
+	*size = b.length;
+	return *data != NULL;
+}
+
+/* Halve an image (box filter), for an atlas that would not fit. */
+static bool halve(struct image *im) {
+	uint32_t w = im->width > 1 ? im->width / 2 : 1, h = im->height > 1 ? im->height / 2 : 1;
+	uint8_t *out = malloc((size_t)w * h * 4);
+	if (!out) return false;
+	for (uint32_t y = 0; y < h; ++y)
+		for (uint32_t x = 0; x < w; ++x)
+			for (int c = 0; c < 4; ++c) {
+				unsigned sum = 0;
+				for (uint32_t dy = 0; dy < 2; ++dy)
+					for (uint32_t dx = 0; dx < 2; ++dx) {
+						uint32_t sx = x * 2 + dx < im->width ? x * 2 + dx : im->width - 1;
+						uint32_t sy = y * 2 + dy < im->height ? y * 2 + dy : im->height - 1;
+						sum += im->rgba[((size_t)sy * im->width + sx) * 4 + (size_t)c];
+					}
+				out[((size_t)y * w + x) * 4 + (size_t)c] = (uint8_t)(sum / 4);
+			}
+	free(im->rgba);
+	im->rgba = out;
+	im->width = w;
+	im->height = h;
+	return true;
+}
+
+/* Shelf-pack rects (w, h already padded) into width W; returns the height
+ * used, or 0 if it passes ATLAS_MAX. */
+static uint32_t shelf_pack(uint32_t (*rect)[4], const size_t *order, size_t n, uint32_t W) {
+	uint32_t x = 0, y = 0, shelf = 0;
+	for (size_t k = 0; k < n; ++k) {
+		uint32_t *r = rect[order[k]];
+		if (!r[2]) continue;
+		if (x + r[2] > W) {
+			x = 0;
+			y += shelf;
+			shelf = 0;
+		}
+		if (r[2] > W) return 0;
+		r[0] = x;
+		r[1] = y;
+		x += r[2];
+		if (r[3] > shelf) shelf = r[3];
+		if (y + shelf > ATLAS_MAX) return 0;
+	}
+	return y + shelf;
+}
+
+static struct image *sort_images;
+static int by_height(const void *a, const void *b) {
+	const struct image *ia = &sort_images[*(const size_t *)a], *ib = &sort_images[*(const size_t *)b];
+	return ia->height < ib->height ? 1 : ia->height > ib->height ? -1 : 0;
+}
+
+/* Decode the images base colour textures use and pack them, with a white
+ * block, into one atlas. Images that do not decode are left out. */
+static bool build_atlas(struct gltf *g) {
+	g->atlas_done = true;
+	const struct json *materials = json_get(&g->root, "materials");
+	g->image_count = json_length(json_get(&g->root, "images"));
+	if (!g->image_count) return true;
+	size_t n = g->image_count + 1; /* the last is the white block */
+	bool *used = calloc(n, sizeof(*used)), *masked = calloc(n, sizeof(*masked));
+	struct image *im = calloc(n, sizeof(*im));
+	size_t *order = malloc(n * sizeof(*order));
+	g->atlas_rect = calloc(n, sizeof(*g->atlas_rect));
+	bool ok = false;
+	if (!used || !masked || !im || !order || !g->atlas_rect) {
+		fail(g, "out of memory");
+		goto done;
+	}
+	for (size_t m = 0; m < json_length(materials); ++m) {
+		size_t set;
+		ptrdiff_t i = material_image(g, json_at(materials, m), &set);
+		if (i < 0) continue;
+		used[i] = true;
+		if (material_masked(json_at(materials, m))) masked[i] = true;
+	}
+	size_t decoded = 0;
+	for (size_t i = 0; i < g->image_count; ++i) {
+		if (!used[i]) continue;
+		const uint8_t *data;
+		size_t size;
+		uint8_t *owned;
+		char error[128];
+		if (!image_bytes(g, i, &data, &size, &owned) ||
+				!image_decode_png(data, size, &im[i], error, sizeof(error))) {
+			free(owned);
+			g->skipped_images++;
+			continue;
+		}
+		free(owned);
+		/* An opaque material ignores the texture's alpha. */
+		if (!masked[i])
+			for (size_t p = 0; p < (size_t)im[i].width * im[i].height; ++p) im[i].rgba[p * 4 + 3] = 255;
+		decoded++;
+	}
+	if (!decoded) {
+		ok = true;
+		goto done;
+	}
+	im[n - 1].width = im[n - 1].height = WHITE_SIZE;
+	im[n - 1].rgba = malloc(WHITE_SIZE * WHITE_SIZE * 4);
+	if (!im[n - 1].rgba) {
+		fail(g, "out of memory");
+		goto done;
+	}
+	memset(im[n - 1].rgba, 255, WHITE_SIZE * WHITE_SIZE * 4);
+
+	for (;;) {
+		uint64_t area = 0;
+		uint32_t widest = 0;
+		for (size_t i = 0; i < n; ++i) {
+			if (!im[i].rgba) continue;
+			g->atlas_rect[i][2] = im[i].width + 2 * ATLAS_PAD;
+			g->atlas_rect[i][3] = im[i].height + 2 * ATLAS_PAD;
+			area += (uint64_t)g->atlas_rect[i][2] * g->atlas_rect[i][3];
+			if (g->atlas_rect[i][2] > widest) widest = g->atlas_rect[i][2];
+		}
+		uint32_t W = 64;
+		while (W < widest || (uint64_t)W * W < area) W *= 2;
+		uint32_t H = 0;
+		for (size_t i = 0; i < n; ++i) order[i] = i;
+		sort_images = im;
+		qsort(order, n, sizeof(*order), by_height);
+		if (W <= ATLAS_MAX) H = shelf_pack(g->atlas_rect, order, n, W);
+		if (H) {
+			g->atlas_w = W;
+			g->atlas_h = H;
+			break;
+		}
+		/* Too big: halve every texture but the white block, and try again. */
+		for (size_t i = 0; i + 1 < n; ++i)
+			if (im[i].rgba && !halve(&im[i])) {
+				fail(g, "out of memory");
+				goto done;
+			}
+	}
+
+	g->atlas = calloc((size_t)g->atlas_w * g->atlas_h, 4);
+	if (!g->atlas) {
+		fail(g, "out of memory");
+		goto done;
+	}
+	for (size_t i = 0; i < n; ++i) {
+		if (!im[i].rgba) continue;
+		uint32_t *r = g->atlas_rect[i];
+		/* The padding repeats the edge texels, so filtering never reaches a
+		 * neighbour. */
+		for (uint32_t y = 0; y < r[3]; ++y)
+			for (uint32_t x = 0; x < r[2]; ++x) {
+				uint32_t sx = x < ATLAS_PAD ? 0 : x - ATLAS_PAD;
+				uint32_t sy = y < ATLAS_PAD ? 0 : y - ATLAS_PAD;
+				if (sx >= im[i].width) sx = im[i].width - 1;
+				if (sy >= im[i].height) sy = im[i].height - 1;
+				memcpy(g->atlas + (((size_t)r[1] + y) * g->atlas_w + r[0] + x) * 4,
+					im[i].rgba + ((size_t)sy * im[i].width + sx) * 4, 4);
+			}
+		/* From here on, the image's own texels. */
+		r[0] += ATLAS_PAD;
+		r[1] += ATLAS_PAD;
+		r[2] = im[i].width;
+		r[3] = im[i].height;
+	}
+	static uint64_t next_key;
+	g->atlas_key = ++next_key;
+	ok = true;
+
+done:
+	for (size_t i = 0; im && i < n; ++i) free(im[i].rgba);
+	free(im);
+	free(used);
+	free(masked);
+	free(order);
+	return ok;
+}
+
+/* uv (glTF's, top-left origin) on image `image` (-1: untextured) to the
+ * scene's uv: into the atlas when there is one, bottom-left origin. */
+static void scene_uv(const struct gltf *g, ptrdiff_t image, const float *uv, float out[2]) {
+	if (!g->atlas) {
+		out[0] = uv ? uv[0] : 0.0f;
+		out[1] = uv ? 1.0f - uv[1] : 0.0f;
+		return;
+	}
+	const uint32_t *r = g->atlas_rect[image >= 0 && g->atlas_rect[image][2] ? (size_t)image : g->image_count];
+	double u = image >= 0 && uv ? uv[0] : 0.5, v = image >= 0 && uv ? uv[1] : 0.5;
+	/* Clamped to the image: an atlas cannot repeat it. */
+	u = fmin(fmax(u, 0.0), 1.0);
+	v = fmin(fmax(v, 0.0), 1.0);
+	double x = r[0] + 0.5 + u * (r[2] - 1), y = r[1] + 0.5 + v * (r[3] - 1);
+	out[0] = (float)(x / g->atlas_w);
+	out[1] = (float)(1.0 - y / g->atlas_h);
 }
 
 static bool emit_primitive(struct gltf *g, const struct json *prim, const struct json *mesh,
@@ -1489,14 +1756,27 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 
 	bool ok = false;
 	float *pos = NULL, *nrm = NULL, *uv = NULL, *wpos = NULL, *wnrm = NULL, *vcolor = NULL;
+	float *ipos = NULL;
 	double base_color[4];
+
+	/* The material: its texture (in the atlas) and texCoord set, sides, ink. */
+	const struct json *material = NULL;
+	size_t material_index;
+	if (json_get(prim, "material") && json_uint(json_get(prim, "material"), SIZE_MAX, &material_index))
+		material = json_at(json_get(&g->root, "materials"), material_index);
+	size_t tex_set = 0;
+	ptrdiff_t image = material ? material_image(g, material, &tex_set) : -1;
+	if (image >= 0 && !(g->atlas && g->atlas_rect[image][2])) image = -1;
+	char tex_name[16];
+	snprintf(tex_name, sizeof(tex_name), "TEXCOORD_%zu", image >= 0 ? tex_set : (size_t)0);
+	bool double_sided = material && truthy(json_get(material, "doubleSided"));
 	uint32_t *idx = NULL, *tris = NULL, *remap = NULL;
 	struct skin_weights sw = {0};
 	size_t count, index_count = 0, tri_count;
 
 	if (!read_accessor(g, position_index, 3, &pos, NULL, &count, "POSITION") ||
 			!read_attribute(g, attributes, "NORMAL", 3, count, &nrm, what) ||
-			!read_attribute(g, attributes, "TEXCOORD_0", 2, count, &uv, what) ||
+			!read_attribute(g, attributes, tex_name, 2, count, &uv, what) ||
 			!material_color(g, prim, base_color, what) ||
 			!read_vertex_colors(g, attributes, count, &vcolor, what) ||
 			!apply_morph_targets(g, prim, mesh, node, count, pos, nrm, what))
@@ -1530,12 +1810,25 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 		skinned = sw.sets > 0;
 	}
 
+	struct gltf_look look = { .shade = 1.0f };
+	if (e->visible && g->options->look) {
+		const char *node_name = json_str(json_get(node, "name"));
+		const char *material_name = json_str(json_get(material, "name"));
+		g->options->look(node_name ? node_name : "", material_name ? material_name : "",
+			&look, g->options->look_data);
+		if (!(look.shade >= 0.0f && look.shade <= 1.0f)) look.shade = 1.0f;
+	}
+	/* An ink line needs normals to push its shell out along. */
+	const struct gltf_ink ink = look.ink;
+	bool has_ink = nrm && ink.width > 0.0 && isfinite(ink.width);
+
 	/* Transform only the vertices the triangles use: primitives often share
 	 * one large vertex buffer. */
 	remap = malloc(count * sizeof(*remap));
 	wpos = malloc(count * 3 * sizeof(*wpos));
 	if (nrm) wnrm = malloc(count * 3 * sizeof(*wnrm));
-	if (!remap || !wpos || (nrm && !wnrm)) {
+	if (has_ink) ipos = malloc(count * 3 * sizeof(*ipos));
+	if (!remap || !wpos || (nrm && !wnrm) || (has_ink && !ipos)) {
 		fail(g, "out of memory");
 		goto done;
 	}
@@ -1547,9 +1840,12 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 		uint32_t v = tris[t];
 		if (remap[v] != UINT32_MAX) continue;
 		remap[v] = (uint32_t)used++;
+		double skinning[16];
+		const double *m = e->world;
 		if (skinned) {
-			double m[16], nm[9];
-			skin_matrix(e->skin, &sw, v, e->world, m);
+			double nm[9];
+			skin_matrix(e->skin, &sw, v, e->world, skinning);
+			m = skinning;
 			transform_point(m, pos + v * 3, wpos + v * 3);
 			if (nrm) {
 				mat_normal(nm, m);
@@ -1558,6 +1854,14 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 		} else {
 			transform_point(e->world, pos + v * 3, wpos + v * 3);
 			if (nrm) transform_normal(normal_matrix, nrm + v * 3, wnrm + v * 3);
+		}
+		if (has_ink) {
+			/* Pushed out in the mesh's own space, then posed like the vertex. */
+			const float *n = nrm + v * 3;
+			float l = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+			float k = l > 1e-12f ? (float)ink.width / l : 0.0f;
+			float out[3] = { pos[v * 3] + n[0] * k, pos[v * 3 + 1] + n[1] * k, pos[v * 3 + 2] + n[2] * k };
+			transform_point(m, out, ipos + v * 3);
 		}
 	}
 	if (!skinned && mat_det3(e->world) < 0.0) {
@@ -1569,59 +1873,81 @@ static bool emit_primitive(struct gltf *g, const struct json *prim, const struct
 	}
 
 	if (e->visible) {
-		size_t new_vertices = nrm ? used : tri_count;
-		if (new_vertices > MAX_DRAW_VERTICES - g->vertices.count ||
-				tri_count > MAX_DRAW_VERTICES - g->indices.count) {
+		/* Copies of the surface: its front, its back for a double-sided
+		 * material on a host that culls, and its ink shell. The back and the
+		 * shell are wound the other way; the shell is unlit (zero normal). */
+		enum { FRONT, BACK, INK };
+		bool copy[3] = { true, double_sided && g->options->cull_back_faces, has_ink };
+		size_t per_copy = nrm ? used : tri_count;
+		size_t copies = (size_t)copy[0] + copy[1] + copy[2];
+		if (per_copy * copies > MAX_DRAW_VERTICES - g->vertices.count ||
+				tri_count * copies > MAX_DRAW_VERTICES - g->indices.count) {
 			fail(g, "the scene has more than %zu vertices, more than Shady draws",
 				MAX_DRAW_VERTICES);
 			goto done;
 		}
-		if (!array_reserve(&g->vertices, new_vertices, sizeof(struct shady_environment_vertex)) ||
-				!array_reserve(&g->colors, new_vertices, sizeof(struct shady_environment_color)) ||
-				!array_reserve(&g->indices, tri_count, sizeof(uint32_t))) {
+		if (!array_reserve(&g->vertices, per_copy * copies, sizeof(struct shady_environment_vertex)) ||
+				!array_reserve(&g->colors, per_copy * copies, sizeof(struct shady_environment_color)) ||
+				!array_reserve(&g->indices, tri_count * copies, sizeof(uint32_t))) {
 			fail(g, "out of memory");
 			goto done;
 		}
-		struct shady_environment_vertex *out_v =
-			(struct shady_environment_vertex *)g->vertices.data;
-		struct shady_environment_color *out_c = g->colors.data;
-		uint32_t *out_i = g->indices.data;
-		uint32_t base = (uint32_t)g->vertices.count;
-		if (nrm) {
-			/* Shared vertices, in first-use order. */
-			for (size_t v = 0; v < count; ++v) {
-				if (remap[v] == UINT32_MAX) continue;
-				struct shady_environment_vertex *o = &out_v[base + remap[v]];
-				memcpy(o->position, wpos + v * 3, sizeof(o->position));
-				memcpy(o->normal, wnrm + v * 3, sizeof(o->normal));
-				/* glTF puts the UV origin top-left; the scene, like OBJ, bottom-left. */
-				o->uv[0] = uv ? uv[v * 2] : 0.0f;
-				o->uv[1] = uv ? 1.0f - uv[v * 2 + 1] : 0.0f;
-				out_c[base + remap[v]] = vertex_color(base_color, vcolor, v);
-			}
-			for (size_t t = 0; t < tri_count; ++t) out_i[g->indices.count + t] = base + remap[tris[t]];
-			g->vertices.count += used;
-			g->colors.count += used;
-		} else {
-			/* Flat shading needs a vertex per triangle corner. */
-			for (size_t t = 0; t < tri_count; t += 3) {
-				float n[3];
-				flat_normal(wpos + tris[t] * 3, wpos + tris[t + 1] * 3, wpos + tris[t + 2] * 3, n);
-				for (int k = 0; k < 3; ++k) {
-					uint32_t v = tris[t + k];
-					struct shady_environment_vertex *o = &out_v[base + t + k];
-					memcpy(o->position, wpos + v * 3, sizeof(o->position));
-					memcpy(o->normal, n, sizeof(o->normal));
-					o->uv[0] = uv ? uv[v * 2] : 0.0f;
-					o->uv[1] = uv ? 1.0f - uv[v * 2 + 1] : 0.0f;
-					out_c[base + t + k] = vertex_color(base_color, vcolor, v);
-					out_i[g->indices.count + t + k] = base + (uint32_t)(t + k);
+		struct shady_environment_color ink_color;
+		memcpy(ink_color.rgba, ink.rgba, sizeof(ink_color.rgba));
+		ink_color.rgba[3] = 0.0f; /* unlit */
+		for (int kind = FRONT; kind <= INK; ++kind) {
+			if (!copy[kind]) continue;
+			struct shady_environment_vertex *out_v =
+				(struct shady_environment_vertex *)g->vertices.data;
+			struct shady_environment_color *out_c = g->colors.data;
+			uint32_t *out_i = (uint32_t *)g->indices.data + g->indices.count;
+			uint32_t base = (uint32_t)g->vertices.count;
+			float sign = kind == BACK ? -1.0f : 1.0f;
+			/* Corner k of a triangle, in this copy's winding. */
+			static const int flipped[3] = { 0, 2, 1 };
+			const int *order = kind == FRONT ? (const int[3]){ 0, 1, 2 } : flipped;
+			if (nrm) {
+				/* Shared vertices, in first-use order. */
+				for (size_t v = 0; v < count; ++v) {
+					if (remap[v] == UINT32_MAX) continue;
+					struct shady_environment_vertex *o = &out_v[base + remap[v]];
+					if (kind == INK) {
+						memcpy(o->position, ipos + v * 3, sizeof(o->position));
+						memset(o->normal, 0, sizeof(o->normal));
+						scene_uv(g, -1, NULL, o->uv);
+						out_c[base + remap[v]] = ink_color;
+					} else {
+						memcpy(o->position, wpos + v * 3, sizeof(o->position));
+						for (int c = 0; c < 3; ++c) o->normal[c] = sign * wnrm[v * 3 + c];
+						scene_uv(g, image, uv ? uv + v * 2 : NULL, o->uv);
+						out_c[base + remap[v]] = vertex_color(base_color, vcolor, v, look.shade);
+					}
 				}
+				for (size_t t = 0; t < tri_count; t += 3)
+					for (int k = 0; k < 3; ++k)
+						out_i[t + (size_t)k] = base + remap[tris[t + (size_t)order[k]]];
+				g->vertices.count += used;
+				g->colors.count += used;
+			} else {
+				/* Flat shading needs a vertex per triangle corner. */
+				for (size_t t = 0; t < tri_count; t += 3) {
+					float n[3];
+					flat_normal(wpos + tris[t] * 3, wpos + tris[t + 1] * 3, wpos + tris[t + 2] * 3, n);
+					for (int k = 0; k < 3; ++k) {
+						uint32_t v = tris[t + (size_t)order[k]];
+						struct shady_environment_vertex *o = &out_v[base + t + (size_t)k];
+						memcpy(o->position, wpos + v * 3, sizeof(o->position));
+						for (int c = 0; c < 3; ++c) o->normal[c] = sign * n[c];
+						scene_uv(g, image, uv ? uv + v * 2 : NULL, o->uv);
+						out_c[base + t + (size_t)k] = vertex_color(base_color, vcolor, v, look.shade);
+						out_i[t + (size_t)k] = base + (uint32_t)(t + (size_t)k);
+					}
+				}
+				g->vertices.count += tri_count;
+				g->colors.count += tri_count;
 			}
-			g->vertices.count += tri_count;
-			g->colors.count += tri_count;
+			g->indices.count += tri_count;
 		}
-		g->indices.count += tri_count;
 	}
 
 	if (e->box >= 0) {
@@ -1645,6 +1971,7 @@ done:
 	free(nrm);
 	free(uv);
 	free(vcolor);
+	free(ipos);
 	free(wpos);
 	free(wnrm);
 	free(idx);
@@ -2187,6 +2514,8 @@ static void gltf_free_inputs(struct gltf *g) {
 	free(g->chain);
 	free(g->world);
 	free(g->world_state);
+	free(g->atlas);
+	free(g->atlas_rect);
 	for (size_t i = 0; i < g->animation_count; ++i) animation_free(&g->animations[i]);
 	free(g->animations);
 	json_free(&g->root);
@@ -2255,7 +2584,7 @@ bool gltf_build(struct gltf *g, const struct gltf_build_options *options,
 	g->vertices.count = g->colors.count = g->indices.count = g->boxes.count = g->triangles.count = 0;
 	g->skipped_primitives = g->ignored_instancing = 0;
 	if (g->node_count) memset(g->world_state, NODE_PENDING, g->node_count);
-	bool ok = emit_scene(g);
+	bool ok = (g->atlas_done || build_atlas(g)) && emit_scene(g);
 	if (ok && !g->indices.count && !g->triangles.count) ok = fail(g, "the scene has no triangles");
 	g->options = NULL;
 	if (!ok) return false;
@@ -2265,8 +2594,11 @@ bool gltf_build(struct gltf *g, const struct gltf_build_options *options,
 		.indices = g->indices.data, .index_count = g->indices.count,
 		.boxes = g->boxes.data, .box_count = g->boxes.count,
 		.triangles = g->triangles.data, .triangle_count = g->triangles.count,
+		.texture = g->atlas, .texture_width = g->atlas_w, .texture_height = g->atlas_h,
+		.texture_key = g->atlas_key,
 		.skipped_primitives = g->skipped_primitives,
 		.ignored_instancing = g->ignored_instancing,
+		.skipped_images = g->skipped_images,
 	};
 	return true;
 }
@@ -2274,6 +2606,10 @@ bool gltf_build(struct gltf *g, const struct gltf_build_options *options,
 void gltf_take_scene(struct gltf *g, struct gltf_scene *out) {
 	out->vertices = g->vertices.data;
 	out->colors = g->colors.data;
+	out->texture = g->atlas;
+	out->texture_width = g->atlas_w;
+	out->texture_height = g->atlas_h;
+	g->atlas = NULL;
 	out->vertex_count = g->vertices.count;
 	out->indices = g->indices.data;
 	out->index_count = g->indices.count;

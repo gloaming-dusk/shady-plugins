@@ -63,6 +63,14 @@ static bool glb_load(shady_host h, const char *path,
 	else
 #endif
 		free((void *)out.colors);
+#if GLTF_HOST_HAS_LOOKS
+	if (SHADY_ENVIRONMENT_SCENE_HAS(scene, texture_key)) {
+		scene->texture = out.texture;
+		scene->texture_width = out.texture_width;
+		scene->texture_height = out.texture_height;
+	} else
+#endif
+		free((void *)out.texture);
 	scene->vertices = out.vertices;
 	scene->vertex_count = out.vertex_count;
 	scene->indices = out.indices;
@@ -82,6 +90,12 @@ static void glb_release(shady_host h, struct shady_environment_scene *scene,
 	if (SHADY_ENVIRONMENT_SCENE_HAS(scene, colors)) {
 		free((void *)scene->colors);
 		scene->colors = NULL;
+	}
+#endif
+#if GLTF_HOST_HAS_LOOKS
+	if (SHADY_ENVIRONMENT_SCENE_HAS(scene, texture_key)) {
+		free((void *)scene->texture);
+		scene->texture = NULL;
 	}
 #endif
 	free((void *)scene->vertices);
