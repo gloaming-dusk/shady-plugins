@@ -1,0 +1,5 @@
+name = "glb-loader"
+description = "Loads binary glTF (.glb) files as the 3D environment, with collision"
+keys = []
+abi = 1
+requires = ["spatial"]

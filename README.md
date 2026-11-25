@@ -13,6 +13,8 @@ compositor, that are not needed by its default rices.
 | [`window-constellation`](plugins/window-constellation/README.md) | `Super+C` | the other windows orbit the focused one |
 | [`window-portal`](plugins/window-portal/README.md) | `Super+P` `Super+Shift+P` | a live portal onto another window |
 | [`close-burn`](plugins/close-burn/README.md) |  | closing windows burn away |
+| [`glb-loader`](plugins/glb-loader/README.md) |  | loads a `.glb` model as the 3D environment, with collision |
+| [`glb-wanderer`](plugins/glb-loader/README.md#glb-wanderer) |  | an animated `.glb` character walks about the floor |
 | [`astral-loom`](plugins/astral-loom/README.md) |  | the sky and glass panels of the retired Astral Loom rice |
 
 A plugin is native code that runs inside the compositor, with access to your

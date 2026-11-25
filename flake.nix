@@ -20,12 +20,15 @@
         meta.license = pkgs.lib.licenses.asl20;
       };
     in {
-      packages = forAllSystems (system: pkgs: {
+      packages = forAllSystems (system: pkgs: rec {
         astral-loom = plugin system pkgs "astral-loom" [ ];
         bad-apple = plugin system pkgs "bad-apple" [ pkgs.libGL ];
         black-hole = plugin system pkgs "black-hole" [ ];
         close-burn = plugin system pkgs "close-burn" [ ];
         frozen-window = plugin system pkgs "frozen-window" [ ];
+        # Also builds glb-wanderer: they share the glTF reader.
+        glb-loader = plugin system pkgs "glb-loader" [ ];
+        glb-wanderer = glb-loader;
         magnetic-windows = plugin system pkgs "magnetic-windows" [ ];
         water-windows = plugin system pkgs "water-windows" [ ];
         window-constellation = plugin system pkgs "window-constellation" [ ];
